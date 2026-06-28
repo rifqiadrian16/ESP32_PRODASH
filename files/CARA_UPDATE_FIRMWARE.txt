@@ -1,0 +1,66 @@
+============================================
+  CARA UPDATE FIRMWARE MODUL LIVINAPRO
+============================================
+
+Yang diperlukan:
+  - Laptop/PC (Windows) yang terhubung ke hotspot HP kamu
+  - HP yang hotspot-nya menyala
+  - Modul LivinaPro
+
+============================================
+LANGKAH-LANGKAH (5 menit):
+============================================
+
+LANGKAH 1 - Siapkan HP dan modul
+  1. Nyalakan Hotspot di HP kamu (nama & password hotspot yang sudah
+     pernah disimpan di modul sebelumnya)
+  2. Buka aplikasi LivinaPro di HP
+  3. Pilih "Mode OTA" atau "Mode Update" di aplikasi
+  4. Modul akan restart dan menyambung ke hotspot kamu
+
+LANGKAH 2 - Sambungkan laptop ke hotspot HP
+  5. Di laptop, sambungkan WiFi ke hotspot HP kamu
+     (hotspot yang sama dengan yang dipakai modul tadi)
+
+LANGKAH 3 - Cari tahu IP modul
+  6. Di HP, buka: Pengaturan → Hotspot & Tethering → Hotspot WiFi
+  7. Tap "Perangkat Terhubung"
+  8. Cari nama "Espressif" atau "ESP32" → catat angka IP-nya
+     Contoh: 192.168.43.105
+
+LANGKAH 4 - Jalankan updater
+  9. Double-click file "LivinaPro_OTA_Updater.exe"
+ 10. Jika muncul Windows SmartScreen → klik "More info" → "Run anyway"
+ 11. Masukkan IP dari langkah 8 ke kolom "IP Address ESP32"
+ 12. Klik tombol hijau "Update Firmware Sekarang"
+ 13. Tunggu progress bar selesai (sekitar 30-60 detik)
+ 14. Jika muncul "Update berhasil" → selesai! Modul restart otomatis.
+
+============================================
+SETELAH UPDATE PERTAMA INI:
+============================================
+Update firmware berikutnya JAUH lebih mudah:
+  1. Nyalakan hotspot HP
+  2. Buka aplikasi → pilih "Mode OTA"
+  3. Tunggu 60 detik
+  4. Selesai! Tidak perlu laptop lagi.
+
+============================================
+MASALAH UMUM:
+============================================
+
+"ESP32 tidak merespons"
+  → Pastikan laptop sudah tersambung ke hotspot HP (bukan WiFi lain)
+  → Cek IP sudah benar (lihat lagi di Pengaturan → Hotspot)
+  → Pastikan modul sudah di Mode OTA (LED atau tampilan berubah?)
+
+"Windows SmartScreen memblokir"
+  → Klik "More info" → "Run anyway"
+  → Ini normal untuk .exe yang belum punya tanda tangan digital
+
+"Gagal unduh firmware"
+  → Laptop perlu akses internet (untuk download firmware dari server)
+  → Jika hotspot HP tidak ada kuota, minta matikan hotspot dulu,
+    sambungkan laptop ke WiFi lain, download selesai, baru pindah ke hotspot
+
+Butuh bantuan? Hubungi: [NOMOR WA KAMU]

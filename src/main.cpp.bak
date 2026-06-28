@@ -1,0 +1,1057 @@
+#include <Arduino.h>
+#include <Preferences.h>
+#include "BluetoothSerial.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ArduinoOTA.h>
+
+// =======================================================
+// 1. PENGATURAN PIN & VARIABEL GLOBAL
+// =======================================================
+const int RELAY_PIN = 4;
+const int SENSOR_UNLOCK_PIN = 18;
+
+
+// Variabel OBD WiFi Dinamis (Bisa diubah lewat aplikasi)
+WiFiClient obdClient;
+String current_obd_ssid = "WiFi_OBDII";
+String current_obd_pass = "";
+String current_obd_ip   = "192.168.0.10";
+int current_obd_port    = 35000;
+String current_obd_pin  = "1234";
+
+Preferences preferences;
+int currentMode = 1;
+
+BluetoothSerial SerialBT;
+// Variabel MAC OBD Dinamis
+uint8_t targetMac[6]; 
+bool hasStoredMac = false;
+bool triggerBtScan = false;
+bool triggerWifiScan = false;
+bool waitingMacNotified = false;
+String pendingRawCommand = "";
+
+struct FoundDevice { String name; String mac; bool ready = false; };
+FoundDevice foundQueue[10];
+int foundCount = 0;
+
+// Variabel Data Mobil
+int currentSpeed = 0, currentRPM = 0, currentTemp = 0;
+bool isLocked = false, obdConnected = false;
+float currentVolt = 0.0, currentMAF = 0.0;
+int currentIAT = 0, currentTiming = 0, currentThrottle = 0;
+float currentSTFT = 0.0, currentLTFT = 0.0;
+
+// Variabel Kontrol
+unsigned long lastValidDataTime = 0;
+unsigned long lastReconnectAttempt = 0;
+int reconnectFailCount = 0;
+unsigned long lastUnlockTime = 0;
+unsigned long relayTriggerTime = 0;
+bool isRelayActive = false;
+
+bool isBtScanning = false;
+unsigned long btScanStartTime = 0;
+const int BT_SCAN_DURATION = 5000; // 5 detik, tapi NON-BLOCKING
+
+bool autoLockEnabled = true;
+int autoLockSpeed = 15; // Default 15 km/h
+
+const int POLL_SEQ[] = {
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 2, 9,  // RPM -> Throttle -> Suhu  -> Throttle
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 3, 9,  // RPM -> Throttle -> MAF   -> Throttle
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 4, 9,  // RPM -> Throttle -> Volt  -> Throttle
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 5, 9,  // RPM -> Throttle -> IAT   -> Throttle
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 6, 9,  // RPM -> Throttle -> STFT  -> Throttle
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 7, 9,  // RPM -> Throttle -> LTFT  -> Throttle
+  0, 9, 1, 9,  // RPM -> Throttle -> Speed -> Throttle
+  0, 9, 8, 9   // RPM -> Throttle -> Timing-> Throttle
+};
+const int POLL_SEQ_LEN = 56;
+int seqIdx = 0;
+
+// =======================================================
+// 2. PENGATURAN BLE (Pipa Komunikasi ke HP)
+// =======================================================
+String sendOBD(String command);
+String sendOBDWiFi(String command);
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pTxCharacteristic = NULL;
+BLECharacteristic* pRxCharacteristic = NULL;
+bool deviceConnected = false;
+
+bool manualDisconnect = false;
+
+
+// UUID Standar untuk Aplikasi
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID_TX "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Kirim ke HP
+#define CHARACTERISTIC_UUID_RX "8c38148b-3db4-46c6-bb50-51b68181fb6b" // Terima dari HP
+
+// Logika saat HP Konek/Diskonek ke BLE
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("[BLE] HP Terhubung!");
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("[BLE] HP Terputus! Memulai ulang pancaran...");
+      pServer->startAdvertising(); 
+    }
+};
+
+// Logika saat HP ngirim
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue().c_str();
+      Serial.println("[BLE] Perintah dari HP: " + rxValue);
+
+      // 1. PENGATURAN MAC ADDRESS OBD (Untuk Mode 1 - Bluetooth)
+      if (rxValue.startsWith("SET_OBD_MAC:")) {
+        String macStr = rxValue.substring(12); // Format: "XX:XX:XX:XX:XX:XX"
+        preferences.putString("obd_mac", macStr);
+        Serial.println("MAC OBD Baru Disimpan: " + macStr);
+        
+        // Konversi string MAC ke array byte untuk targetMac
+        for (int i = 0; i < 6; i++) {
+          targetMac[i] = strtol(macStr.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
+        }
+        hasStoredMac = true;
+      }
+
+      else if (rxValue.startsWith("SET_OBD_PIN:")) {
+        current_obd_pin = rxValue.substring(12);
+        current_obd_pin.trim();
+        preferences.putString("obd_pin", current_obd_pin);
+        Serial.println("[BLE] PIN OBD2 Disimpan: " + current_obd_pin);
+      }
+
+      // 2. PENGATURAN HOTSPOT HP CUSTOMER (Untuk Mode 0 - OTA/Update)
+      else if (rxValue.startsWith("WIFI_SSID:")) {
+        String newSSID = rxValue.substring(10);
+        preferences.putString("ssid", newSSID);
+        Serial.println("SSID Customer Disimpan: " + newSSID);
+      } 
+      else if (rxValue.startsWith("WIFI_PASS:")) {
+        String newPass = rxValue.substring(10);
+        preferences.putString("pass", newPass);
+        Serial.println("Password Customer Disimpan.");
+      }
+
+      // 3. PENGATURAN OBD WIFI (Untuk Mode 2 - WiFi)
+      else if (rxValue.startsWith("SET_OBD_WIFI_SSID:")) {
+        String ssidWifi = rxValue.substring(18);
+        preferences.putString("obd_ssid", ssidWifi);
+        Serial.println("SSID OBD WiFi Disimpan: " + ssidWifi);
+      }
+      else if (rxValue.startsWith("SET_OBD_WIFI_IP:")) {
+        String ipWifi = rxValue.substring(16);
+        preferences.putString("obd_ip", ipWifi);
+        Serial.println("IP OBD WiFi Disimpan: " + ipWifi);
+      }
+      else if (rxValue.startsWith("SET_OBD_WIFI_PORT:")) {
+        int portWifi = rxValue.substring(18).toInt();
+        preferences.putInt("obd_port", portWifi);
+        Serial.println("Port OBD WiFi Disimpan: " + String(portWifi));
+      }
+
+      // 4. KONTROL KONEKSI (Manual Bypass/Standby)
+      else if (rxValue == "DISCONNECT_OBD") {
+        manualDisconnect = true;
+        SerialBT.disconnect();
+        if (obdClient.connected()) obdClient.stop();
+        Serial.println("Status: Standby/Bypass (Akses Car Scanner diijinkan).");
+      } 
+      else if (rxValue == "CONNECT_OBD") {
+        manualDisconnect = false;
+        lastReconnectAttempt = 0;
+        Serial.println("Status: Resuming OBD Connection...");
+      }
+
+      else if (rxValue == "START_BT_SCAN") {
+        triggerBtScan = true;
+        Serial.println("Perintah Radar Scan BT Diterima!");
+      }
+
+      else if (rxValue == "START_WIFI_SCAN") {
+        triggerWifiScan = true;
+        Serial.println("Perintah Radar Scan WiFi Diterima!");
+      }
+
+      // 5. PERINTAH GANTI MODE OPERASIONAL & RESTART
+      else if (rxValue == "SET_MODE_0") {
+        preferences.putInt("mode", 0);
+        Serial.println("Mode berubah ke 0 (OTA). Restarting...");
+        delay(500); ESP.restart();
+      } 
+      else if (rxValue == "SET_MODE_1") {
+        preferences.putInt("mode", 1);
+        preferences.putInt("last_mode", 1);
+        Serial.println("Mode berubah ke 1 (BT). Restarting...");
+        delay(500); ESP.restart();
+      } 
+      else if (rxValue == "SET_MODE_2") {
+        preferences.putInt("mode", 2);
+        preferences.putInt("last_mode", 2);
+        Serial.println("Mode berubah ke 2 (WiFi). Restarting...");
+        delay(500); ESP.restart();
+      }
+      else if (rxValue == "AUTOLOCK_ON") {
+        autoLockEnabled = true;
+        preferences.putBool("autolock", true);
+        Serial.println("Auto Lock: ENABLED");
+      }
+      else if (rxValue == "AUTOLOCK_OFF") {
+        autoLockEnabled = false;
+        preferences.putBool("autolock", false);
+        Serial.println("Auto Lock: DISABLED");
+      }
+      else if (rxValue.startsWith("SET_LOCK_SPEED:")) {
+        autoLockSpeed = rxValue.substring(15).toInt();
+        preferences.putInt("lockspeed", autoLockSpeed);
+        Serial.println("Auto Lock Speed: " + String(autoLockSpeed) + " km/h");
+      }
+      else if (rxValue == "GET_CONFIG") {
+        if (deviceConnected) {
+          String cfg = "CONFIG:autolock=" + String(autoLockEnabled ? 1 : 0) +
+                      ",lockspeed=" + String(autoLockSpeed) +
+                      ",mode=" + String(currentMode) +
+                      ",hasmac=" + String(hasStoredMac ? 1 : 0);
+          pTxCharacteristic->setValue(cfg.c_str());
+          pTxCharacteristic->notify();
+          Serial.println("[BLE] Config dikirim ke HP: " + cfg);
+        }
+      }
+      else if (rxValue == "FACTORY_RESET") {
+        Serial.println("⚠️ [BLE] Perintah Factory Reset Diterima! Menghapus semua memori...");
+        
+        preferences.clear();
+        
+        if (deviceConnected) {
+          pTxCharacteristic->setValue("STATUS:RESET_DONE");
+          pTxCharacteristic->notify();
+        }
+        
+        delay(500); 
+        ESP.restart();
+      }
+      else if (rxValue == "TEST_RELAY") {
+        // static variable agar dia ingat status terakhirnya (nyala atau mati)
+        static bool statusRelayTest = false; 
+        
+        // Balikkan statusnya (kalau mati jadi nyala, kalau nyala jadi mati)
+        statusRelayTest = !statusRelayTest; 
+        
+        if (statusRelayTest) {
+            digitalWrite(RELAY_PIN, HIGH); // Nyala (NPN Transistor Butuh HIGH)
+            Serial.println("🔥 TEST: RELAY ON (Cetek!)");
+        } else {
+            digitalWrite(RELAY_PIN, LOW);  // Mati
+            Serial.println("💤 TEST: RELAY OFF");
+        }
+      }
+      else if (rxValue.startsWith("RAW:")) {
+        // HANYA TITIP PESAN SAJA, JANGAN DITEMBAK DI SINI!
+        pendingRawCommand = rxValue.substring(4); 
+        
+        Serial.print("[TERMINAL] Pesan dititipkan ke Antrean VIP: "); 
+        Serial.println(pendingRawCommand);
+      }
+    }
+};
+
+// Fungsi memulai pemancar BLE
+void initBLE() {
+  BLEDevice::init("LivinaProDash");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_TX,
+                        BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  pRxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_RX,
+                        BLECharacteristic::PROPERTY_WRITE);
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  BLEAdvertisementData advData;
+  advData.setName("LivinaProDash");
+  pAdvertising->setAdvertisementData(advData);
+  pAdvertising->start();
+
+  Serial.println("[BLE] Sinyal LivinaProDash sudah memancar!");
+}
+
+// Fungsi mengirim data ke HP
+void kirimDataKeHP() {
+  if (deviceConnected) {
+    // Format JSON dipadatkan agar cepat dikirim via udara
+    String dataString = "{\"s\":" + String(currentSpeed) + 
+                        ",\"r\":" + String(currentRPM) + 
+                        ",\"t\":" + String(currentTemp) + 
+                        ",\"v\":" + String(currentVolt, 1) + 
+                        ",\"m\":" + String(currentMAF, 2) + 
+                        ",\"i\":" + String(currentIAT) + 
+                        ",\"st\":" + String(currentSTFT, 1) + 
+                        ",\"lt\":" + String(currentLTFT, 1) + 
+                        ",\"tm\":" + String(currentTiming) + 
+                        ",\"th\":" + String(currentThrottle) + 
+                        ",\"l\":" + String(isLocked ? 1 : 0) + "}";
+    
+    pTxCharacteristic->setValue(dataString.c_str());
+    pTxCharacteristic->notify(); 
+  }
+}
+
+// =======================================================
+// 3. FUNGSI KOMUNIKASI OBD
+// =======================================================
+String sendOBD(String command) {
+  Serial.println("[OBD_BT_TX] MENGIRIM: " + command);
+  while (SerialBT.available()) SerialBT.read();
+  SerialBT.print(command + "\r");
+  String response = "";
+  response.reserve(50);
+  unsigned long startTimer = millis();
+  while (millis() - startTimer < 800) {
+    if (SerialBT.available()) {
+      char c = SerialBT.read();
+      if (c == '>') break;
+      response += c;
+    }
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+  response.replace("\r", ""); response.replace("\n", ""); response.replace(" ", "");
+  Serial.println("[OBD_BT_RX] DITERIMA: " + response);
+  return response;
+}
+
+String sendOBDWiFi(String command) {
+  if (!obdClient.connected()) return "";
+  Serial.println("[OBD_WIFI_TX] MENGIRIM: " + command);
+  
+  // Kosongkan sisa buffer sebelumnya
+  while (obdClient.available()) obdClient.read(); 
+  
+  obdClient.print(command + "\r");
+  String response = "";
+  response.reserve(50);
+  
+  unsigned long startTimer = millis();
+  while (millis() - startTimer < 800) {
+    if (obdClient.available()) {
+      char c = obdClient.read();
+      if (c == '>') break;
+      response += c;
+    }
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+  response.replace("\r", ""); response.replace("\n", ""); response.replace(" ", "");
+  Serial.println("[OBD_WIFI_RX] DITERIMA: " + response);
+  return response;
+}
+
+// void initOBD2WiFi() {
+//   Serial.println("=== ECU BANGUN (VIA WIFI) ===");
+//   sendOBDWiFi("ATZ"); delay(500); sendOBDWiFi("ATE0"); delay(200); sendOBDWiFi("ATSP5"); delay(200);
+//   sendOBDWiFi("ATSH 81 10 F0"); delay(200); sendOBDWiFi("ATAT1"); delay(100); sendOBDWiFi("ATST 10"); delay(100); sendOBDWiFi("ATFI"); delay(1500);
+// }
+
+// void initOBD2() {
+//   Serial.println("=== ECU BANGUN ===");
+//   sendOBD("ATZ"); delay(500); sendOBD("ATE0"); delay(200); sendOBD("ATSP5"); delay(200);
+//   sendOBD("ATSH 81 10 F0"); delay(200); sendOBD("ATAT1"); delay(100); sendOBD("ATST 10"); delay(100); sendOBD("ATFI"); delay(1500);
+// }
+
+void initOBD2WiFi() {
+  Serial.println("=== MULAI INISIALISASI ECU (WIFI) ===");
+  Serial.println("1. Reset OBD (ATZ)..."); sendOBDWiFi("ATZ"); delay(500); 
+  Serial.println("2. Matikan Echo (ATE0)..."); sendOBDWiFi("ATE0"); delay(200); 
+  Serial.println("3. Set Protokol 5 (ATSP5)..."); sendOBDWiFi("ATSP5"); delay(200);
+  Serial.println("4. Set Header Nissan (ATSH 81 10 FC)..."); sendOBDWiFi("ATSH 81 10 FC"); delay(200); 
+  Serial.println("5. Adaptive Timing (ATAT1)..."); sendOBDWiFi("ATAT1"); delay(100); 
+  Serial.println("6. Set Timeout (ATST 10)..."); sendOBDWiFi("ATST 10"); delay(100); 
+  Serial.println("7. Fast Init (ATFI)..."); sendOBDWiFi("ATFI"); delay(1500);
+  Serial.println("=== INISIALISASI ECU SELESAI ===");
+}
+
+void initOBD2() {
+  Serial.println("=== MULAI INISIALISASI ECU (BLUETOOTH) ===");
+  Serial.println("1. Reset OBD (ATZ)..."); sendOBD("ATZ"); delay(500); 
+  Serial.println("2. Matikan Echo (ATE0)..."); sendOBD("ATE0"); delay(200); 
+  Serial.println("3. Set Protokol 5 (ATSP5)..."); sendOBD("ATSP5"); delay(200);
+  Serial.println("4. Set Header Nissan (ATSH 81 10 FC)..."); sendOBD("ATSH 81 10 FC"); delay(200); 
+  Serial.println("5. Adaptive Timing (ATAT1)..."); sendOBD("ATAT1"); delay(100); 
+  Serial.println("6. Set Timeout (ATST 10)..."); sendOBD("ATST 10"); delay(100); 
+  Serial.println("7. Fast Init (ATFI)..."); sendOBD("ATFI"); delay(1500);
+  Serial.println("=== INISIALISASI ECU SELESAI ===");
+}
+
+// =======================================================
+// 4. SETUP & LOOP
+// =======================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, LOW);
+  pinMode(SENSOR_UNLOCK_PIN, INPUT_PULLUP);
+
+  preferences.begin("LivinaDash", false);
+
+  // 1. Load Mode & Data WiFi Customer
+  currentMode = preferences.getInt("mode", 1);
+  current_obd_pin = preferences.getString("obd_pin", "1234");
+  String savedSSID = preferences.getString("ssid", "Iqi"); 
+  String savedPass = preferences.getString("pass", "12345678");
+
+  // 2. Load Settingan OBD WiFi (Untuk Mode 2)
+  current_obd_ssid = preferences.getString("obd_ssid", "WiFi_OBDII");
+  current_obd_pass = preferences.getString("obd_pass", "");
+  current_obd_ip   = preferences.getString("obd_ip", "192.168.0.10");
+  current_obd_port = preferences.getInt("obd_port", 35000);
+
+  // 3. Load MAC OBD Bluetooth (Untuk Mode 1)
+  String storedMac = preferences.getString("obd_mac", "");
+  if (storedMac != "" && storedMac.length() >= 17) {
+    for (int i = 0; i < 6; i++) {
+      targetMac[i] = strtol(storedMac.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
+    }
+    hasStoredMac = true;
+  }
+
+  autoLockEnabled = preferences.getBool("autolock", true);
+  autoLockSpeed = preferences.getInt("lockspeed", 15);
+
+  Serial.println("\n--- LIVINA PRO DASH V2 (MASS READY) ---");
+  if (currentMode != 0) {
+    initBLE(); 
+  }
+
+  if (currentMode == 0) {
+    // ==========================================
+    // MODE 0: OTA & MAINTENANCE (WIFI AKTIF)
+    // ==========================================
+    Serial.println("MASUK MODE OTA & UPDATE...");
+    
+    WiFi.mode(WIFI_STA);
+    
+    // ✅ PERBAIKAN: Gunakan SSID dan Pass dari memori (diubah ke format char array)
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    
+    // Nunggu WiFi Konek
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      if (millis() - wifiStart > 15000) { // timeout 15 detik
+        Serial.println("\n[WIFI] Gagal! Balik ke Mode 1...");
+        preferences.putInt("mode", 1);
+        delay(500); ESP.restart();
+      }
+      delay(500); Serial.print(".");
+    }
+    // Lapor IP ke ThingSpeak
+    HTTPClient http;
+    String url = "http://api.thingspeak.com/update?api_key=D3HJLFYFGO4PLG08&field1=" + WiFi.localIP().toString();
+    http.begin(url);
+    http.GET();
+    http.end();
+    Serial.println("\nIP Dilaporkan ke ThingSpeak!");
+
+    ArduinoOTA.onStart([]() {
+      Serial.println("\n[OTA] Proses Update Dimulai via WiFi...");
+      int modeSebelumnya = preferences.getInt("last_mode", 1); 
+      preferences.putInt("mode", modeSebelumnya);
+    });
+
+    ArduinoOTA.onEnd([]() {
+      Serial.println("\n[OTA] Update Sukses! ESP32 akan merestart dirinya...");
+      delay(300);
+    });
+
+    // Setup OTA
+    ArduinoOTA.begin();
+
+  } 
+  else if (currentMode == 1) {
+    // ==========================================
+    // MODE 1: OBD BLUETOOTH (WIFI MATI)
+    // ==========================================
+    WiFi.mode(WIFI_OFF);
+    Serial.println("Mencari OBD2...");
+    
+    // ✅ PERBAIKAN: Bluetooth Classic HANYA dinyalakan di Mode 1
+    SerialBT.begin("LivinaProDash_OBD", true);
+    SerialBT.setPin(current_obd_pin.c_str());
+    
+  } else if (currentMode == 2) {
+    // ==========================================
+    // MODE 2: OBD WIFI (WIFI STA + BLE AKTIF)
+    // ==========================================
+    Serial.println("-> MODE 2: OBD WIFI AKTIF");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(current_obd_ssid.c_str(), current_obd_pass.c_str());
+    // Koneksi Socket akan dikelola di dalam loop()
+  }
+}
+
+void loop() {
+  // =======================================================
+  // KAMAR 1: MODE 0 (MAINTENANCE, WIFI, OTA & THINGSPEAK)
+  // =======================================================
+  if (currentMode == 0) {
+    // Di mode ini, ESP32 fokus penuh menangani WiFi
+    // untuk update firmware dari laptop Mas.
+    ArduinoOTA.handle();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  } 
+  
+  // =======================================================
+  // KAMAR 2: MODE 1 (OPERASIONAL HARIAN VIA OBD BLUETOOTH)
+  // =======================================================
+  else if (currentMode == 1) {
+
+    if (pendingRawCommand != "") {
+      Serial.println("[TERMINAL VIP] Mengeksekusi perintah...");
+      String rawRes = sendOBD(pendingRawCommand);
+      
+      // Bersihkan enter/spasi
+      rawRes.replace("\r", " ");
+      rawRes.replace("\n", "");
+      
+      // Kirim balik ke layar HP
+      if (deviceConnected) {
+        String msg = "RAW_RES:" + rawRes;
+        pTxCharacteristic->setValue(msg.c_str());
+        pTxCharacteristic->notify();
+      }
+      
+      Serial.println("[TERMINAL VIP] Balasan dikirim ke HP: " + rawRes);
+      
+      pendingRawCommand = ""; // Kosongkan antrean
+      vTaskDelay(200 / portTICK_PERIOD_MS); // Beri nafas ke ELM327
+      return; // Langsung ulang loop dari atas, tunda baca RPM/Speed!
+    }
+    
+    if (triggerBtScan) {
+      triggerBtScan = false;
+      isBtScanning = true;
+      btScanStartTime = millis();
+
+      if (deviceConnected) {
+        pTxCharacteristic->setValue("SCAN_STATUS:SCANNING");
+        pTxCharacteristic->notify();
+      }
+
+      Serial.println("[BT] Memulai Async Radar...");
+
+      foundCount = 0;
+      for (int i = 0; i < 10; i++) {
+        foundQueue[i].ready = false;
+        foundQueue[i].name = "";
+        foundQueue[i].mac = "";
+      }
+
+      // ✅ Async: callback dipanggil per device, radio tidak dimonopoli
+      SerialBT.discoverAsync([](BTAdvertisedDevice* pDevice) {
+      String name = pDevice->getName().c_str();
+      if (name.length() > 0 && foundCount < 10) {
+        foundQueue[foundCount].name = name;
+        foundQueue[foundCount].mac  = pDevice->getAddress().toString().c_str();
+        foundQueue[foundCount].ready = true;
+        foundCount++;
+      }
+     });
+    }
+
+    // --- STOP SCAN setelah durasi habis (non-blocking check) ---
+    if (isBtScanning && millis() - btScanStartTime >= BT_SCAN_DURATION) {
+      SerialBT.discoverAsyncStop();
+      isBtScanning = false;
+
+      if (deviceConnected) {
+        pTxCharacteristic->setValue("SCAN_STATUS:DONE");
+        pTxCharacteristic->notify();
+      }
+      Serial.println("[BT] Radar selesai.");
+    }
+
+    if (triggerWifiScan) {
+      triggerWifiScan = false;
+      if (deviceConnected) {
+        pTxCharacteristic->setValue("SCAN_STATUS:SCANNING");
+        pTxCharacteristic->notify();
+      }
+      
+      Serial.println("[WIFI] Memulai Radar WiFi terdekat...");
+      WiFi.mode(WIFI_STA); // Pastikan mode WiFi nyala untuk nge-scan
+      WiFi.disconnect();
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      
+      int n = WiFi.scanNetworks();
+      if (n > 0) {
+        for (int i = 0; i < n; ++i) {
+          String ssid = WiFi.SSID(i);
+          if (ssid.length() > 0) {
+            // Kita numpang format yang sama: "Nama|WIFI" (MAC kita ganti tulisan WIFI)
+            String msg = "SCAN_FOUND:" + ssid + "|WIFI";
+            if (deviceConnected) {
+              pTxCharacteristic->setValue(msg.c_str());
+              pTxCharacteristic->notify();
+              vTaskDelay(150 / portTICK_PERIOD_MS); 
+            }
+          }
+        }
+      }
+
+      WiFi.mode(WIFI_OFF); // ← tambahkan ini, kembalikan radio ke BT Classic
+      Serial.println("[WIFI] Radar Selesai, WiFi dimatikan.");
+      
+      if (deviceConnected) {
+        pTxCharacteristic->setValue("SCAN_STATUS:DONE");
+        pTxCharacteristic->notify();
+      }
+      Serial.println("[WIFI] Radar Selesai.");
+      return;
+    }
+
+    for (int i = 0; i < foundCount; i++) {
+      if (foundQueue[i].ready && deviceConnected) {
+        String msg = "SCAN_FOUND:" + foundQueue[i].name + "|" + foundQueue[i].mac;
+        pTxCharacteristic->setValue(msg.c_str());
+        pTxCharacteristic->notify();
+        foundQueue[i].ready = false;
+        vTaskDelay(150 / portTICK_PERIOD_MS);
+      }
+    }
+
+    if (manualDisconnect) {
+      vTaskDelay(500 / portTICK_PERIOD_MS); // Istirahat, jangan bajak OBD2
+      return; 
+    }
+
+    // 2. LOGIKA RECONNECT KONEKSI OBD2
+    if (!SerialBT.connected(10)) {
+      if (obdConnected) { obdConnected = false; isLocked = false; reconnectFailCount = 0; }
+
+      if (!hasStoredMac) {
+        if (deviceConnected) {
+          static unsigned long lastMacNotify = 0;
+          // ESP32 akan terus teriak "WAITING_MAC" setiap 2 detik sampai HP merespon!
+          if (millis() - lastMacNotify > 2000) { 
+            pTxCharacteristic->setValue("STATUS:WAITING_MAC");
+            pTxCharacteristic->notify();
+            lastMacNotify = millis();
+          }
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS); // Istirahat sebentar biar tidak hang
+        return;
+      }
+
+      waitingMacNotified = false;
+
+      unsigned long interval = min(5000UL + (unsigned long)reconnectFailCount * 2000UL, 15000UL);
+      if (millis() - lastReconnectAttempt > interval) {
+        lastReconnectAttempt = millis();
+        reconnectFailCount++;
+        Serial.println("[OBD] Memutus koneksi lama...");
+        SerialBT.disconnect(); vTaskDelay(200 / portTICK_PERIOD_MS);
+        Serial.println("[OBD] Menghapus pairing nyangkut...");
+        SerialBT.unpairDevice(targetMac); vTaskDelay(500 / portTICK_PERIOD_MS); 
+        
+        Serial.printf("[OBD] MENCOBA KONEK KE MAC: %02X:%02X:%02X:%02X:%02X:%02X dengan PIN: %s\n", 
+                      targetMac[0], targetMac[1], targetMac[2], targetMac[3], targetMac[4], targetMac[5], current_obd_pin.c_str());
+                      
+        if (SerialBT.connect(targetMac)) {
+          Serial.println("[OBD] KONEKSI FISIK BLUETOOTH BERHASIL! Menyiapkan komunikasi...");
+          vTaskDelay(500 / portTICK_PERIOD_MS); SerialBT.print("\r"); vTaskDelay(500 / portTICK_PERIOD_MS);
+          while (SerialBT.available()) SerialBT.read();
+          reconnectFailCount = 0; 
+          initOBD2(); 
+          obdConnected = true; 
+          lastValidDataTime = millis();
+          Serial.println("[OBD] ESP32 & ECU SIAP TEMPUR!");
+        } else {
+          Serial.println("[OBD] GAGAL KONEK FISIK! ELM327 menolak atau tidak ditemukan.");
+        }
+      }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      return;
+    }
+
+    // 3. WATCHDOG (MENCEGAH ZOMBIE CONNECTION)
+    if (millis() - lastValidDataTime > 8000 && obdConnected) {
+      SerialBT.disconnect(); obdConnected = false; vTaskDelay(500 / portTICK_PERIOD_MS); return;
+    }
+
+    
+    // 4. POLLING BACA DATA MOBIL
+    if (pendingRawCommand != "") {
+      Serial.println("[BYPASS BT] Menembak kode manual...");
+      String res = sendOBD(pendingRawCommand);
+      if (deviceConnected) {
+        String msg = "RAW_OBD:" + res;
+        pTxCharacteristic->setValue(msg.c_str());
+        pTxCharacteristic->notify();
+      }
+      pendingRawCommand = "";
+      lastValidDataTime = millis();
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      return; // Langsung ulang loop dari awal, lewati polling biasa
+    }
+
+    int pid = POLL_SEQ[seqIdx];
+    seqIdx = (seqIdx + 1) % POLL_SEQ_LEN;
+    bool dataBerubah = false;
+
+    if (pid == 0) { // RPM
+    String res = sendOBD("2212010401"); 
+    int idx = res.indexOf("621201");
+    if (idx != -1 && res.length() >= idx + 10) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      int B = strtol(res.substring(idx + 8, idx + 10).c_str(), NULL, 16);
+      currentRPM = (int)((A * 3200.0) + (B * 12.5));
+      lastValidDataTime = millis();
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 1) { // SPEED
+    String res = sendOBD("2211020401");
+    int idx = res.indexOf("621102");
+    if (idx != -1 && res.length() >= idx + 8) {
+      currentSpeed = (int)(strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16) * 2.0);
+      lastValidDataTime = millis();
+      dataBerubah = true;
+      if (autoLockEnabled && currentSpeed >= autoLockSpeed && !isLocked && !isRelayActive) {
+        digitalWrite(RELAY_PIN, HIGH); 
+        relayTriggerTime = millis();  
+        isRelayActive = true;         
+        isLocked = true;
+      }
+    }
+  }
+  else if (pid == 2) { // TEMP
+    String res = sendOBD("2211010401");
+    int idx = res.indexOf("621101");
+    if (idx != -1 && res.length() >= idx + 8) {
+      currentTemp = (int)strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16) - 50;
+      dataBerubah = true;
+    }
+    
+  }
+  else if (pid == 3) { // MAF
+    String res = sendOBD("2212090401");
+    int idx = res.indexOf("621209");
+    if (idx != -1 && res.length() >= idx + 10) {
+      float valA = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      float valB = strtol(res.substring(idx + 8, idx + 10).c_str(), NULL, 16);
+      currentMAF = (valA * 1.28) + ((valB * 1.27) / 255.0);
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 4) { // VOLT
+    String res = sendOBD("ATRV");
+    if (res.indexOf("V") != -1) { res.replace("V", ""); currentVolt = res.toFloat();
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 5) { // IAT (Kandidat Suhu Nissan: 1106)
+    String res = sendOBD("2211060401"); 
+    int idx = res.indexOf("621106");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      currentIAT = A - 50; 
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 6) { // STFT (Nissan A/F Alpha B1: 1123)
+    String res = sendOBD("2211230401");
+    int idx = res.indexOf("621123");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      // Di Nissan, angka 100 berarti 0% (Campuran Ideal)
+      currentSTFT = A - 100.0;
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 7) { // LTFT (Nissan A/F Alpha Self Learn: 1125)
+    String res = sendOBD("2211250401");
+    int idx = res.indexOf("621125");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      currentLTFT = A - 100.0;
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 8) { // TIMING (Nissan 22110A)
+    String res = sendOBD("22110A0401");
+    int idx = res.indexOf("62110A");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      currentTiming = 110 - A; // Rumus dari file Java
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 9) { // ACCELERATOR PEDAL (Nissan 22120E)
+    String res = sendOBD("22120E0401");
+    res.replace(" ","");
+    int idx = res.indexOf("62120E");
+    if (idx != -1 && res.length() >= idx + 10) {
+      int A = strtol(res.substring(6, 8).c_str(), NULL, 16); 
+      int B = strtol(res.substring(8, 10).c_str(), NULL, 16);
+      // Rumus Volts & Kalibrasi 0-100%
+      float volt = (A * 1.28) + (B * 1.27 / 255.0);
+      float percent = ((volt - 0.78) / (4.48 - 0.78)) * 100.0;
+      
+      // Clamping agar tidak minus/lebih dari 100
+      if (percent < 0) percent = 0;
+      if (percent > 100) percent = 100;
+      
+      currentThrottle = (int)percent; 
+      dataBerubah = true;
+    }
+  }
+
+    // 5. UPDATE DATA KE APLIKASI LIVINA PRODASH DI HP (Via BLE)
+    if (dataBerubah) {
+      kirimDataKeHP();
+    }
+
+    // 6. MATIKAN RELAY CENTRAL LOCK (Durasi tarikan 0.5 detik)
+    if (isRelayActive && (millis() - relayTriggerTime >= 500)) {
+      digitalWrite(RELAY_PIN, LOW); isRelayActive = false;
+    }
+
+    // 7. SENSOR UNLOCK MANUAL (Buka pintu manual)
+    if (digitalRead(SENSOR_UNLOCK_PIN) == LOW) {
+      if (millis() - lastUnlockTime > 1000) {
+        // ✅ TAMBAHKAN CEK: Hanya kirim kalau sebelumnya locked
+        if (isLocked) { 
+          isLocked = false; 
+          kirimDataKeHP(); 
+          Serial.println("[LOCK] Pintu dibuka manual.");
+        }
+        lastUnlockTime = millis();
+      }
+    }
+    
+    // Istirahat sejenak agar CPU tidak overheat
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }else if (currentMode == 2) {
+    // =======================================================
+    // KAMAR 3: MODE 2 (OPERASIONAL HARIAN VIA OBD WIFI)
+    // =======================================================
+    
+    // Fitur Standby (Bypass Car Scanner)
+    if (manualDisconnect) {
+      if (obdClient.connected()) obdClient.stop();
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      return; 
+    }
+
+    // 1. Cek Koneksi Jaringan WiFi ke Hotspot OBD2
+    if (WiFi.status() != WL_CONNECTED) {
+      obdConnected = false;
+      Serial.println("[WIFI] Mencari Hotspot OBD2...");
+
+      static unsigned long lastWifiReconnect = 0;
+      if (millis() - lastWifiReconnect > 5000) { // Coba reconnect tiap 5 detik
+        lastWifiReconnect = millis();
+        WiFi.disconnect();
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        WiFi.begin(current_obd_ssid.c_str(), current_obd_pass.c_str());
+        Serial.println("[WIFI] Mencoba reconnect...");
+      }
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      return;
+    }
+
+    // 2. Cek Koneksi TCP Socket ke IP OBD2
+    if (!obdClient.connected()) {
+      if (obdConnected) { obdConnected = false; isLocked = false; reconnectFailCount = 0; }
+      
+      Serial.println("[TCP] Menyambungkan ke IP OBD2...");
+      if (obdClient.connect(current_obd_ip.c_str(), current_obd_port)) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        obdClient.print("\r"); // Knock bangunin ELM
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        initOBD2WiFi();
+        obdConnected = true;
+        lastValidDataTime = millis();
+        Serial.println("[TCP] Berhasil Konek ke OBD WiFi!");
+      } else {
+        Serial.println("[TCP] Gagal konek, coba lagi...");
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+      }
+      return;
+    }
+
+    // 3. Watchdog & Polling Data
+    if (millis() - lastValidDataTime > 8000 && obdConnected) {
+      obdClient.stop(); obdConnected = false; vTaskDelay(500 / portTICK_PERIOD_MS); return;
+    }
+
+    if (pendingRawCommand != "") {
+      Serial.println("[BYPASS WIFI] Menembak kode manual...");
+      String res = sendOBDWiFi(pendingRawCommand);
+      if (deviceConnected) {
+        String msg = "RAW_OBD:" + res;
+        pTxCharacteristic->setValue(msg.c_str());
+        pTxCharacteristic->notify();
+      }
+      pendingRawCommand = "";
+      lastValidDataTime = millis();
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      return; 
+    }
+
+    int pid = POLL_SEQ[seqIdx];
+    seqIdx = (seqIdx + 1) % POLL_SEQ_LEN;
+    bool dataBerubah = false;
+
+    if (pid == 0) { // RPM
+    String res = sendOBDWiFi("2212010401"); 
+    int idx = res.indexOf("621201");
+    if (idx != -1 && res.length() >= idx + 10) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      int B = strtol(res.substring(idx + 8, idx + 10).c_str(), NULL, 16);
+      currentRPM = (int)((A * 3200.0) + (B * 12.5));
+      lastValidDataTime = millis();
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 1) { // SPEED
+    String res = sendOBDWiFi("2211020401");
+    int idx = res.indexOf("621102");
+    if (idx != -1 && res.length() >= idx + 8) {
+      currentSpeed = (int)(strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16) * 2.0);
+      lastValidDataTime = millis(); 
+      dataBerubah = true;
+      if (autoLockEnabled && currentSpeed >= autoLockSpeed && !isLocked && !isRelayActive) {
+        digitalWrite(RELAY_PIN, HIGH); 
+        relayTriggerTime = millis();  
+        isRelayActive = true;         
+        isLocked = true;
+      }
+    }
+  }
+  else if (pid == 2) { // TEMP
+    String res = sendOBDWiFi("2211010401");
+    int idx = res.indexOf("621101");
+    if (idx != -1 && res.length() >= idx + 8) {
+      currentTemp = (int)strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16) - 50;
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 3) { // MAF
+    String res = sendOBDWiFi("2212090401");
+    int idx = res.indexOf("621209");
+    if (idx != -1 && res.length() >= idx + 10) {
+      float valA = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      float valB = strtol(res.substring(idx + 8, idx + 10).c_str(), NULL, 16);
+      currentMAF = (valA * 1.28) + ((valB * 1.27) / 255.0);
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 4) { // VOLT
+    String res = sendOBDWiFi("ATRV");
+    if (res.indexOf("V") != -1) { res.replace("V", ""); currentVolt = res.toFloat();
+    dataBerubah = true; }
+  }
+  else if (pid == 5) { // IAT (Kandidat Suhu Nissan: 1106)
+    String res = sendOBDWiFi("2211060401"); 
+    int idx = res.indexOf("621106");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      currentIAT = A - 50; 
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 6) { // STFT (Nissan A/F Alpha B1: 1123)
+    String res = sendOBDWiFi("2211230401");
+    int idx = res.indexOf("621123");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      // Di Nissan, angka 100 berarti 0% (Campuran Ideal)
+      currentSTFT = A - 100.0; 
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 7) { // LTFT (Nissan A/F Alpha Self Learn: 1125)
+    String res = sendOBDWiFi("2211250401");
+    int idx = res.indexOf("621125");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      currentLTFT = A - 100.0;
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 8) { // TIMING (Nissan 22110A)
+    String res = sendOBDWiFi("22110A0401");
+    int idx = res.indexOf("62110A");
+    if (idx != -1 && res.length() >= idx + 8) {
+      int A = strtol(res.substring(idx + 6, idx + 8).c_str(), NULL, 16);
+      currentTiming = 110 - A; // Rumus dari file Java
+      dataBerubah = true;
+    }
+  }
+  else if (pid == 9) { // ACCELERATOR PEDAL (Nissan 22120E)
+    String res = sendOBDWiFi("22120E0401");
+    res.replace(" ","");
+    int idx = res.indexOf("62120E");
+    if (idx != -1 && res.length() >= idx + 10) {
+      int A = strtol(res.substring(6, 8).c_str(), NULL, 16); 
+      int B = strtol(res.substring(8, 10).c_str(), NULL, 16);
+      // Rumus Volts & Kalibrasi 0-100%
+      float volt = (A * 1.28) + (B * 1.27 / 255.0);
+      float percent = ((volt - 0.78) / (4.48 - 0.78)) * 100.0;
+      
+      // Clamping agar tidak minus/lebih dari 100
+      if (percent < 0) percent = 0;
+      if (percent > 100) percent = 100;
+      
+      currentThrottle = (int)percent; 
+      dataBerubah = true;
+    }
+  }
+    if (dataBerubah) kirimDataKeHP();
+
+    if (isRelayActive && (millis() - relayTriggerTime >= 500)) {
+      digitalWrite(RELAY_PIN, LOW); isRelayActive = false;
+    }
+    
+    // Logika Sensor Unlock sama persis dengan Mode 1
+    if (digitalRead(SENSOR_UNLOCK_PIN) == LOW) {
+      if (millis() - lastUnlockTime > 1000) {
+        // ✅ TAMBAHKAN CEK: Hanya kirim kalau sebelumnya locked
+        if (isLocked) { 
+          isLocked = false; 
+          kirimDataKeHP(); 
+          Serial.println("[LOCK] Pintu dibuka manual.");
+        }
+        lastUnlockTime = millis();
+      }
+    }
+    
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
